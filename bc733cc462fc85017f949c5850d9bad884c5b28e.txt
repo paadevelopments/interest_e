@@ -1,0 +1,337 @@
+
+After going through what has been the most interesting Twitter space I've ever 
+listened in on ( https://mobile.twitter.com/i/spaces/1yoKMWVQpWpJQ ) by @KiddBubu,
+here is my proposed solution to the simple E-Levy implementation.
+
+NOTE: This is just me tackling few of the technical aspects including the data flow of such a
+system and highlighting few ways to solve some of the expected issues.
+
+This document is purely a "structural" concept. And is based on highly probable instances
+backed by my little understanding of all referred technologies.
+
+As such it is ONLY open to further technical optimizations, recommendations and
+better implementation methodologies.
+
+If there is any implementation that you think is inefficient, I welcome your solution.
+
+
+ACRONYMS
+___________
+
+SP 	= Service Provider [ MTN, Vodafone, etc ]
+GRA	= Ghana Revenue Authority ( System Admin )
+GC	= Ghana Card
+
+Assumed Tax Percentage	= 1.51
+
+
+THE TRANSACTION
+_______________
+
+A typical mobile money transfer process between Akua and Barima. A USSD session.
+
+Akua 		:: 	Sending GHc200 to Barima [ dials momo code ].
+
+SP		:: 	[ R1 ] Checks the availability of the necessary GRA's API [ before 
+			enabling/starting Akua's transfer session. ]
+
+GRA		:: 	Returns success signifying its API availability.
+
+SP		:: 	Allows Akua to start her transfer session.
+
+Akua		:: 	Starts the transfer process. [ enters Barima's number, her GC ID number,
+			amount, etc. ]
+
+SP		:: 	[ I1 ] Processes self ID, balance and pin validation on Akua's provided
+			information. If true, go on.
+
+SP		:: 	[ R2 ] Initiates an API request to the GRA's API with sample body data-set 
+			as follows:
+		   	{
+		     	origin: { number: "0201231234", gc_id: "GH0000000" },
+		     	destination : { number: "0201001000", gc_id: "GH0000001" },
+  		     	amount: 200
+		   	}
+
+GRA		:: 	[ I2 ] Validates origin and destination data provided by [ R2 ]. It then 
+			calculates the payable tax based on past logged transactions and payment
+			thresholds, GC number identification, store the lookup/query and returns 
+			a response with sample data-set as follows:
+		   	{
+				payable_tax : 1.15, gra_pay_destination : { momo : { ... } },
+				look_up_id : 1
+		   	}
+
+SP 		::	[ I3 ] Shows a confirmation message to Akua containing the tax charge of her 
+			transaction based on the payable_tax from [ I2 ]. And ask her to either 
+			proceed with the payment or discard.
+
+Akua 		::	Confirms.
+
+SP		:: 	[ I4 ] Run balance check on Akua's account and if she has enough balance,
+			then processes her transaction [ deduct for origin (Akua), add for 
+			destination (Barima) accounts ].
+		   	^ Pay to "gra_pay_destination" (I will clarify in the next secction).
+
+SP		:: 	[ R3 ] Sends a (Akua & Barima) "transaction processed" notice (request) 
+			with SP transaction ID to GRA. Request will come with a body in a 
+			form similar to:
+			{
+				look_up_id : 1, transaction_id : 100100, success : true
+			}
+
+GRA		:: 	[ I5 ] UPDATES the transaction using the "look_up_id" and tag it as part of 
+			successful transactions for Akua and returns a success response similar to:
+			{
+				success : true
+			}
+SP		:: 	[ I6 ] On receiving GRA's last success message, sends a final payment SMS 
+			to Akua. SMS will include SP transaction ID and GRA's look_up_id.
+
+
+STEP CLARIFICATION. [ R# & I# ]
+_______________________________
+
+R1	=	The goal for this initial ping/request is to make sure that the needed API
+		endpoint of GRA's system necessary for the successful execution of this 
+		transaction is available.
+		In case of the daily transactions log reset, this will serve as a checker for 
+		whether or not GRA's system is available. if (false), transaction should not
+		be done or can be post processed.
+
+I1	=	"Self" validation. Implying the usual transaction element validation done
+		by the SPs. Like, "balance > 0" check, right PIN, right ID, etc.
+
+R2	=	This request's body/data, per the SAMPLE data structure used above, will 
+		differ from that of a bank's transaction. The endpoint should be programmed
+		to handle both instances.
+		Also, the sent data should ONLY contain essential info for the validation
+		process. This will reduce data leakage and ultimately reduce latency.
+
+I2	=	Although, this endpoint only runs identification validation on the participating
+		accounts and tax amount calculations, it should also store the query/lookup
+		after all validation is successful. Storage data as:
+		(
+			Id = "increamental and assign by database software", Name = Akua,
+			Number = 0201231234, G_card_id = GH000000, Amount = 200,
+			DateTime = "2022-04-20 18:11:04", Status = "query",
+			Transaction_ID = null, Tax = 1.51, Network = "Vodafone",
+			Hash = sha256( Amount + G_card_id + Number + Tax )
+		)
+
+		After storing, the row ID is sent as part of the response as "look_up_id".
+		This ID can be substituted for a UUID to prevent easy guesses during a brute-force 
+		Attack (a remote possibility).
+
+		Also, the "look_up_id" will reduce data size on the [ R3 ] request.
+
+		The "gra_pay_destination" value is the account (momo/bank/crypto [ just kidding ])
+		info to which the tax is paid to. If it is in a momo form, the account phone
+		number should be a part of the "tax exceptions". Which i will cover in a moment.
+
+		The overall processing of this script [ I2 ] should utilize an efficient
+		database querying mechanism. As a rule of thumb, query ONLY the needed meta
+		data for all validations. No ( SELECT * ) queries. This will help speed up
+		execution time.
+
+I3	=	The main goal for this confirmation message to Akua is to notify her about the tax
+		value on her transaction. And should be given the option to either proceed with
+		the transaction or discard. This will further add up to the transparent image
+		of the system.
+		*Requires more optimization.
+
+I4	=	The balance check here is different from that on step [ I1 ]. This goes further
+		to check if Akua's available balance is enough to pay for the total (amount + tax)
+		value. [ I1 ] is for (balance > 0) validation. If she has enough balance, process
+		the deduction for Akua and deduction for Barima add to.
+		*Requires more optimization.
+
+		The (pay to gra_pay_destination) "tax payment" done here should not affect Akua's
+		overall waiting time during her transfer process. Hence, it should be done
+		automatically or manually without waiting for a status response to proceed to the 
+		next step.
+
+R3	=	This request is to notify GRA that Akua's transaction is successful and should 
+		be updated to have that tag. This request will have a sample the data-set as:
+		{
+			look_up_id : 1, transaction_id : 100100, success : true
+		}
+		The SP will provide the "transaction_id" and the "look_up_id" will be obtained
+		from the previous request response [ I2 ]. "success" will be always be TRUE in
+		this case and can be somewhat redundant.
+		*Requires more optimization.
+
+I5	=	GRA on receiving [ R3 ] will process it as follows.
+		1. Validate the "look_up_id" provided in [ R3 ] if it exists.
+		2. UPDATE the look up row, set "transaction_id" = "transaction_id provided in [ R3 ]", 
+		"status" = "pending" if it had a status of "query".
+		NOTE: The "status" value will be changed to "paid" by GRA if they get the tax
+		money paid for that transaction.
+		
+		If UPDATE is successful, return a "success" response.
+
+		Since this script does little, execution time should be very minute.
+
+I6	=	The final successful transaction SMS to Akua should contain both the SP's
+		"transaction id" and that of GRA's "look_up_id". These two data will serve as a
+		way to verify that both the SP and GRA participated in the process and their
+		actions can be justified.
+
+
+SYSTEM ESSENTIALS
+_________________
+
+1.	Reducing Latencies.
+	-	The above process involves 3 API cycles (1 cycle = 1 request + 1 response). The goal
+	is to keep the number of internal API calls to the bare minimum and create less dependency
+	on external entities.
+
+	-	GRA's system should be on servers within the country. So the data transfer distance can be
+	reduced.
+
+	-	All endpoint scripts should have fast execution times. Logic optimization, proper flow
+	control, caching efficiencies and high processing capabilities (the use of fast servers)
+	are essential to reduce some level of latency.
+
+	-	GRA's system should have high bandwidth and use propagation protocols such as HTTP/2.
+	SP's on the other hand, i assume already have the right infrastructure for fast data transmissions.
+
+	-	Ideally, GRA's system should have all Ghana Card info and transaction data on a common
+	data-center.
+
+	Instead of being on multiple systems/places that will require multiple API cycles which will
+	collectively increase transaction processing latencies (Akua sending money to Barima).
+
+	Even if the system should communicate with other centers such as that of NIA's
+	(if such thing exist) there should be a periodic data synchronization time. Which
+	is another technicality of its own.
+
+
+2.	Security.
+	- Principally, the less dependent a system is on third party APIs, frameworks, libraries and
+	configurations, the more secure it becomes. With that in mind, GRA's system should be
+	independent and properly configured in aspects including its firewall and traffic
+	monitoring.
+
+	It can be configured to accept requests from known ports and flag others. The port on which
+	the transaction API runs should be only used for that.
+
+	- All SP's and banks utilizing GRA's system API should be given unique access tokens. An
+	app id of a sort. This token can be used for authentications and request origin
+	identification. 
+
+	NOTE: Having an API access token alone doesn't deem a request trustworthy. Further request
+	authentication like accepting requests from ONLY secure channels, properly configured
+	headers, body structure and values validation.
+
+	- GRA's system should run on servers within the country as it stores/processes data of its citizens
+	and will prevent instances of foreign eavesdropping.
+
+	- DDos protection should be available on ONLY software level as request processing script level
+	DDos protection will be overkill - execution time factor.
+
+	- In the case of an API that is accessible via a URL, HTTPS will be the best protocol for
+	request/response communications since the data is encrypted to prevent MITM attacks.
+	Although, it will cost the system some latencies since a non secure data is less in size
+	and will increase propagation time.
+
+	HTTPS or a security well configured TCP will be best.
+
+	- A standard data structure should be defined and accepted. If JSON, all requests/response
+	bodies should follow that format. This will make validations straight forward at all
+	endpoints.
+
+3. 	Transparency.
+	- As an aspiring digitally financial system, transparency is very important for accountability.
+	Especially in a system that springs great disinterest form the people.
+
+	To build that trust between the system and the people, its processes should be open and
+	transparent. Literally.
+
+	- The purpose of the GRA's "look_up_id" and SP's "transaction_id" inclusion in the final
+	message to Akua, gives her access to, the IDs to verify the authenticity of the tax process.
+	If she wants to go looking.
+
+	GRA should have a web portal where the public can query for the information relating to a
+	transaction by a given "look_up_id". Just as you have a block explorer for bitcoin 
+	transactions.
+
+	SPs should also have such a portal for looking up on the same transaction by a given
+	"transaction_id".
+
+	Both parties should store and provide matching data-set. Below is an example of look up 
+	data on both portals. In the case of Akua's transfer, her query on both portals will be;
+
+	GRA [ https://gra.com/transactions/?a=1 ] <== Assumed portal URL. ( Not Accurate )
+	Output::
+	{
+		transaction_id : 100100,
+		network : vodafone,
+		tax : Ghc 1.51,
+		amount : Ghc 200,
+		status : paid,
+		hash : 593bd90b99529bcd6f8f0755666729a605be6fec0fdca7e0bb93eaec5621fa09
+	}
+
+	SP (vodafone) [ https://vodafone.com.gh/momo_t/?a=100100 ] <== Assumed portal URL. ( Not Accurate )
+	Output::
+	{
+		look_up_id : 1,
+		amount : Ghc 200,
+		tax : Ghc 1.51,
+		tax_status : paid,
+		hash : 593bd90b99529bcd6f8f0755666729a605be6fec0fdca7e0bb93eaec5621fa09
+	}
+
+	NOTE: Akua's data such as her phone number, GC details should be OUT OF pubic view.
+	The goal for these public data is to verify that both parties did worked on the
+	transaction and both returned THE SAME (HASH) for a particular transaction.
+
+4.	Data Integrity.
+	-	Since on GRA's system all transactions will be reset after a 24hour (a day) period
+	for all users - in order to implement the "1st 100Ghc exception in a day", at the
+	end of the day, GRA's API should be made inaccessible (temporarily offline) while the
+	reset is done. And made accessible (brought online) afterwards. This will prevent 
+	data validation conflicts.
+
+	An example of such conflict is an instance where a validation script uses an invalid
+	stored-data to validate a given input.
+
+5. 	Exceptions.
+	-	Parties like banks or micro financial entities that relies on SPs to ease payments
+	for their users will have to use momo numbers registered in their organization's name,
+	ID info and must acquire a form of GRA exception license/mandate. So that transactions
+	with such numbers can be identified in the tax validation process and won't accrue
+	charges.
+
+	An exemplary fault if there was no exception will be:
+	Bank A, having a momo number that serves as an entry point for Dede (Bank A's client)
+	to deposit money into her account. Since both momo accounts are owned by different
+	users, without any exception, it will be taxed. Meanwhile, it's a "deposit" from
+	Dede and her Bank's perspective.
+
+	An exemplary fault if there was no exception will be:
+	If GRA wants the SPs to pay the tax from the momo user to their "gra_pay_destination"
+	which happens to be a mobile money destination, taxing that transaction will result
+	in a taxation loop.
+
+	If there was an exception, both instances will be processed properly.
+
+
+CONCLUSION
+__________
+
+This write-up does not illustrate a proposed system structure for that of bank transfers
+because if GRA's API works as intended in this momo instance, it should work for the
+bank’s as well.
+
+Thanks to @KiddBubu for hosting and @edemkumodzi, @devops_rob, @tony_mobster, @ejnbo and 
+@bafr0w for the conversation on the technicalities of such a system. I learnt a lot.
+
+Personally, its refreshing. You would expect interviews from software/network engineers about
+a national digital system on air. Instead, you are met with interviews with political,
+economical and financial experts on national media on a computationally intensive system.
+
+Which is depressing.
+
+Paa.
